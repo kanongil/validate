@@ -1,0 +1,136 @@
+#!/usr/bin/env node
+
+'use strict';
+
+const Process = require('process');
+
+const Bossy = require('bossy');
+
+const Validator = require('..');
+
+
+const definition = {
+    p: {
+        alias: 'package',
+        type: 'string'
+    },
+    r: {
+        alias: 'recursive',
+        type: 'boolean'
+    },
+    l: {
+        alias: 'loose',
+        type: 'boolean'
+    }
+};
+
+const args = Bossy.parse(definition);
+if (args instanceof Error) {
+    console.error(args.message);
+    return;
+}
+
+if (args.h || !args.p) {
+    console.error(Bossy.usage(definition, 'validate -p <package> -f <from version>'));
+    return;
+}
+
+const results = new Map();
+let exiting = false;
+
+const checkAbort = function () {
+
+    if (exiting) {
+        throw new Error('Aborted');
+    }
+};
+
+Process.once('SIGINT', () => {
+
+    exiting = true;
+});
+
+const validatePkg = async function (pkg, version, { loose }) {
+
+    const queryKey = `${pkg}@${version}`;
+    if (results.has(queryKey)) {
+        return { result: results.get(queryKey) };
+    }
+
+    results.set(queryKey, undefined);
+
+    let result, info, versionKey;
+    try {
+        const validator = new Validator(pkg, version, { loose });
+        info = await validator.fetchDetails();
+
+        versionKey = `${pkg}@${info.version}`;
+        if (results.has(versionKey)) {
+            return { result: results.get(versionKey) };
+        }
+        results.set(versionKey, undefined);
+
+        console.log(` * Validating package: ${info.name}@${info.version}`);
+
+        result = await validator.check();
+
+        results.set(versionKey, result);
+        results.set(queryKey, result);
+    }
+    catch (err) {
+        return { error: err, info };
+    }
+
+    return { result, info };
+};
+
+const validate = async function (pkg, version, { loose, recursive } = {}) {
+
+    const { result, error, info } = await validatePkg(pkg, version, { loose, recursive });
+
+    if (error) {
+        console.log(' ! Fail:', error.message);
+        if (error.details && error.details.diff) {
+            console.log(error.details.diff);
+        }
+    }
+
+    let tainted = !result || !result.clean();
+
+    if (recursive && info && info.dependencies) {
+        for (const dep in info.dependencies) {
+            checkAbort();
+            const ok = await validate(dep, info.dependencies[dep], { loose: true, recursive });
+            tainted = tainted || !ok;
+        }
+    }
+
+    return !tainted;
+};
+
+
+(async () => {
+
+    let pkg = args.p;
+    let version = 'latest';
+
+    const atIndex = args.p.lastIndexOf('@');
+    if (atIndex > 1) {
+        pkg = args.p.slice(0, atIndex);
+        version = args.p.slice(atIndex + 1);
+    }
+
+    return await validate(pkg, version, { loose: args.l, recursive: args.r });
+})().then((success) => {
+
+    if (!success) {
+        console.log(' * Completed: Failed');
+        Process.exit(1);
+    }
+
+    console.log(' * Completed: Success');
+}, (err) => {
+
+    console.error(' * Validator error:', err);
+    Process.exit(255);
+});
